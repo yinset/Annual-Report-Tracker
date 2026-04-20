@@ -8,6 +8,7 @@
 - 缓存目录与是否刷新缓存：常量 CACHE_DIR_STR、REFRESH_CACHE（命令行可覆盖）。
   **重要**：`--cache-dir` 下 `http_get/` 仅存**新浪网页正文**（`<sha256>.txt` UTF-8，配套同名 `.json` 元数据；用于解析 PDF 链接），**不是**年报 PDF 原件。
 - PDF 输出根目录：常量 OUTPUT_DIR_STR（命令行 `--output` 可覆盖）；**PDF 原件**路径形如「输出根/行业/公司名-代码-报告期年份.pdf」（行业下不再有年份子目录）。
+- 新浪 PDF 若 404/410：在**同一输出根目录**追加写入 `missing_pdfs.log`（UTF-8 TSV，含代码、公告标题、PDF URL、目标路径等）。
 - 网络拉取均带 tqdm 字节/步骤进度条；`--no-progress` 可关闭。
 - `--sleep`（股票阶段末）：仅当该股本次「年报列表或公告详情」发生过真实 HTTP 时才休眠；若全文均命中磁盘缓存则不休眠。**下载 PDF 成功后**仍会按 `--sleep` 休眠一次（针对文件服务器）。
 - 新浪可能返回 HTTP 456（非标准码，多为限流/风控）：网页请求间有最小间隔与抖动；遇 456/429/502/503 等会**写日志并抛出**，请加大 `--http-interval` 与 `--sleep` 后重跑。
@@ -67,9 +68,11 @@ REPORT_YEAR_START: int = _default_report_year
 REPORT_YEAR_END: int = _default_report_year
 
 # 网络缓存根目录（其下含 `http_get/` 网页快照、`akshare/` 证券列表缓存；可为绝对路径）
-CACHE_DIR_STR: str = r"C:\Users\11825\OneDrive\Annual-Report-Tracker\.cache\sina_annual_reports"
+CACHE_DIR_STR: str = r"D:\Annual-Report-Tracker\.cache\sina_annual_reports"
 # 年报 PDF 输出根目录（可为绝对路径；其下 行业/公司名称-代码-年份.pdf）
 OUTPUT_DIR_STR: str = r"D:\Annual_Report_Output"
+# 新浪 PDF 404/410 等缺失时追加写入输出根目录（与 --output 一致，默认即 D:\\Annual_Report_Output）
+MISSING_PDF_LOG_FILENAME: str = "missing_pdfs.log"
 # 为 True 时忽略 HTTP/akshare 磁盘缓存，强制重新请求（不删除已完成的 PDF）
 REFRESH_CACHE: bool = False
 
@@ -124,6 +127,49 @@ def _log_http_failure(r: requests.Response, url: str) -> None:
     )
     logger.error("响应头 Content-Type=%s Content-Length=%s", r.headers.get("Content-Type"), r.headers.get("Content-Length"))
     logger.error("响应体预览(前4KB):\n%s", preview)
+
+
+def _append_missing_pdf_log(
+    output_root: Path,
+    *,
+    reason: str,
+    code: str,
+    name: str,
+    industry: str,
+    announce_date: str,
+    year: int,
+    title: str,
+    pdf_url: str,
+    dest_path: Path,
+) -> None:
+    """将缺失的 PDF 一条记录追加到输出根目录下的 MISSING_PDF_LOG_FILENAME（UTF-8 TSV）。"""
+    root = output_root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / MISSING_PDF_LOG_FILENAME
+
+    def _flat(s: str) -> str:
+        return s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    fields = [
+        ts,
+        reason,
+        code,
+        _flat(name),
+        _flat(industry),
+        announce_date,
+        str(year),
+        _flat(title),
+        pdf_url,
+        str(dest_path.resolve()),
+    ]
+    line = "\t".join(fields) + "\n"
+    with path.open("a", encoding="utf-8") as f:
+        if f.tell() == 0:
+            f.write(
+                "时间\t原因\t代码\t简称\t行业\t公告日期\t报告期年份\t公告标题\tPDF_URL\t目标路径\n"
+            )
+        f.write(line)
 
 
 def _tqdm(*args: Any, **kwargs: Any) -> Any:
@@ -548,10 +594,13 @@ def download_pdf(
     dest: Path,
     *,
     progress_desc: Optional[str] = None,
-) -> None:
+) -> bool:
     """
     流式下载 PDF；支持断点续传（.pdf.part 非空则带 Range 续传）。
     同一路径的 .part.meta.json 记录 URL，若与本次 PDF URL 不一致则清空分片重来。
+
+    若服务端返回 404/410（对象存储上已无此文件），记录警告并返回 False，不抛异常。
+    成功落盘则返回 True。
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     part, meta_path = _pdf_part_paths(dest)
@@ -583,6 +632,15 @@ def download_pdf(
                 meta_path.unlink(missing_ok=True)
                 resume_from = 0
                 continue
+            if r.status_code in (404, 410):
+                part.unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
+                logger.warning(
+                    "PDF 在新浪侧已不存在(%s)，跳过（列表链接可能过期或文件已下架）: %s",
+                    r.status_code,
+                    pdf_url,
+                )
+                return False
             if r.status_code not in (200, 206):
                 _log_http_failure(r, pdf_url)
                 r.raise_for_status()
@@ -634,6 +692,7 @@ def download_pdf(
     )
     part.replace(dest)
     meta_path.unlink(missing_ok=True)
+    return True
 
 
 def iter_jobs(
@@ -855,7 +914,7 @@ def main() -> None:
     )
     industry_map = cache.load_code_industry_map()
 
-    ok = skip = 0
+    ok = skip = missing_pdf = 0
     for code, name, industry, ann, year, title, pdf_url in iter_jobs(
         stocks,
         sess,
@@ -884,11 +943,28 @@ def main() -> None:
             year,
             urlparse(pdf_url).path[-40:],
         )
-        download_pdf(sess, pdf_url, dest, progress_desc=f"{code} {year}")
-        ok += 1
-        time.sleep(args.sleep)
+        if download_pdf(sess, pdf_url, dest, progress_desc=f"{code} {year}"):
+            ok += 1
+            time.sleep(args.sleep)
+        else:
+            missing_pdf += 1
+            out_root = args.output.resolve()
+            _append_missing_pdf_log(
+                out_root,
+                reason="404/410",
+                code=code,
+                name=name,
+                industry=industry,
+                announce_date=ann,
+                year=year,
+                title=title,
+                pdf_url=pdf_url,
+                dest_path=dest,
+            )
 
-    logger.info("完成。成功: %s, 跳过: %s", ok, skip)
+    logger.info("完成。成功: %s, 跳过: %s, PDF 缺失(404/410): %s", ok, skip, missing_pdf)
+    if missing_pdf:
+        logger.info("缺失明细文件: %s", args.output.resolve() / MISSING_PDF_LOG_FILENAME)
 
 
 if __name__ == "__main__":
