@@ -17,7 +17,7 @@
 - 断点续传：
   - 已完成 PDF：目标 .pdf 已存在且大于 0 字节则跳过下载；若你设定的报告期年份区间内、该股票对应路径下的 PDF **全部**已存在，则**不再读取**该股年报列表（含缓存），以加快重跑；
   - 未完成 PDF：使用 .pdf.part + HTTP Range 续传；
-  - 公告列表/详情页：写入 `cache-dir/http_get/`（`<sha256>.txt` + `.json`；便于断点续跑），**与 PDF 输出路径无关**；
+  - 公告列表/详情页：写入 `cache-dir/http_get/`（`<sha256>.txt` + `.json`；便于断点续跑），**与 PDF 输出路径无关**；若详情命中缓存但解析不到 PDF，会先按 `--sleep` 节奏休眠再强制发 HTTP 刷新详情，仍无 PDF 则跳过。
   - akshare 拉取的股票列表 / 代码简称映射：默认落盘缓存，命中则不再请求网络。
 
 依赖：akshare（仅用于拉取证券列表）、requests（抓取新浪页面与 PDF）、tqdm（进度条）、logging（错误与运行日志）。
@@ -280,12 +280,14 @@ class NetCache:
         response_encoding: str = "gb18030",
         timeout: int = 60,
         progress_desc: Optional[str] = None,
+        force_network: bool = False,
     ) -> tuple[str, bool]:
         """GET 网页并解码为 str；网络拉取时显示字节进度条；正文以 UTF-8 写入 `http_get/<sha>.txt`，元数据写入同名 `.json`。
 
         返回 (正文, used_http)：后者为 True 表示本次经历了 HTTP（非磁盘缓存命中）。
+        force_network=True 时跳过磁盘命中，直接请求并覆盖缓存（用于缓存正文无 PDF 时的再校验）。
         """
-        if self._http_get_url_is_disk_cached(url):
+        if not force_network and self._http_get_url_is_disk_cached(url):
             self._http_get_dir.mkdir(parents=True, exist_ok=True)
             key = hashlib.sha256(url.encode("utf-8")).hexdigest()
             cache_txt = self._http_get_dir / f"{key}.txt"
@@ -580,12 +582,28 @@ def report_year_from_title(title: str, announce_date: str) -> Optional[int]:
     return None
 
 
+def _pdf_url_from_detail_html(html: str) -> Optional[str]:
+    """从公告详情页 HTML 中解析 PDF 直链；无则 None。"""
+    m = _PDF_HREF.search(html)
+    if not m:
+        m = re.search(
+            r"(https?://file\.finance\.sina\.com\.cn[^\s\"'<>]+\.(?:pdf|PDF))",
+            html,
+            re.I,
+        )
+        if m:
+            return m.group(1)
+        return None
+    return m.group("url")
+
+
 def fetch_pdf_url(
     sess: requests.Session,
     detail_url: str,
     cache: NetCache,
     *,
     stock_code: str = "",
+    force_network: bool = False,
 ) -> tuple[Optional[str], bool]:
     detail_url = _canonical_bulletin_detail_url(detail_url)
     hint = f" {stock_code}" if stock_code else ""
@@ -595,18 +613,10 @@ def fetch_pdf_url(
         response_encoding="gb18030",
         timeout=60,
         progress_desc=f"公告详情{hint}",
+        force_network=force_network,
     )
-    m = _PDF_HREF.search(html)
-    if not m:
-        m = re.search(
-            r"(https?://file\.finance\.sina\.com\.cn[^\s\"'<>]+\.(?:pdf|PDF))",
-            html,
-            re.I,
-        )
-        if m:
-            return m.group(1), used_http
-        return None, used_http
-    return m.group("url"), used_http
+    pdf_url = _pdf_url_from_detail_html(html)
+    return pdf_url, used_http
 
 
 def _pdf_part_paths(dest: Path) -> tuple[Path, Path]:
@@ -846,6 +856,24 @@ def iter_jobs(
                         _sleep_stock_paced(sleep_min_sec, sleep_jitter_sec)
                 pdf_url, detail_used_http = fetch_pdf_url(sess, href, cache, stock_code=code)
                 stock_used_http = stock_used_http or detail_used_http
+                if not pdf_url and not detail_used_http:
+                    # 缓存正文解析不到 PDF：先节奏休眠再强制拉网，若仍无则跳过
+                    if stock_sleep_on:
+                        _sleep_stock_paced(sleep_min_sec, sleep_jitter_sec)
+                    pdf_url, detail_used_http = fetch_pdf_url(
+                        sess,
+                        href,
+                        cache,
+                        stock_code=code,
+                        force_network=True,
+                    )
+                    stock_used_http = stock_used_http or detail_used_http
+                    if pdf_url:
+                        logger.info(
+                            "[详情重拉] 缓存无 PDF，网络刷新后已发现链接 %s %s",
+                            code,
+                            title[:50],
+                        )
                 if not pdf_url:
                     logger.info("[无PDF] %s %s", code, title[:50])
                     if stock_sleep_on and detail_used_http:
