@@ -10,7 +10,7 @@
 - PDF 输出根目录：常量 OUTPUT_DIR_STR（命令行 `--output` 可覆盖）；**PDF 原件**路径形如「输出根/行业/公司名-代码-报告期年份.pdf」（行业下不再有年份子目录）。
 - 新浪 PDF 若 404/410：在**同一输出根目录**追加写入 `missing_pdfs.log`（UTF-8 TSV，含代码、公告标题、PDF URL、目标路径等）。
 - 网络拉取均带 tqdm 字节/步骤进度条；`--no-progress` 可关闭。
-- 全脚本统一的节奏休眠（默认约 0.8～2.0 秒）：`PACE_SLEEP_MIN_SEC` + Uniform(0, `PACE_SLEEP_JITTER_SEC`)。用于：两次成功 **HTTP 网页** 之间的最小间隔（`--http-interval` / `--http-jitter` 默认与此相同）、**股票阶段末**（`--sleep` / `--sleep-jitter`，仅当列表/详情曾走 HTTP）、**同一只股票切换报告期年份**（仅当下一条详情将走网络而非命中 `http_get` 缓存）、**下载 PDF 成功后**（仅当本条公告详情曾走 HTTP）、**PDF 遇限流/网关重试**前。
+- 全脚本统一的节奏休眠：`PACE_SLEEP_MIN_SEC` + Uniform(0, `PACE_SLEEP_JITTER_SEC`)。用于：两次成功 **HTTP 网页** 之间的最小间隔（`--http-interval` / `--http-jitter` 默认与此相同）、**股票阶段末**（`--sleep` / `--sleep-jitter`，仅当列表/详情曾走 HTTP）、**同一只股票切换报告期年份**（仅当下一条详情将走网络而非命中 `http_get` 缓存）、**下载 PDF 成功后**（仅当本条公告详情曾走 HTTP）、**PDF 遇限流/网关重试**前。
 - `--sleep` / `--sleep-jitter`：凡命中磁盘缓存、未发 HTTP 的步骤不触发上述节奏休眠（`_pace_before_http` 本身也只在真正发请求前执行）。
 - 新浪可能返回 HTTP 456（非标准码，多为限流/风控）：网页请求间有最小间隔与抖动；**网页**遇 456/429/502/503 等会写日志并抛出（可调大 `--http-interval`）。**PDF 下载**遇 429/456/502/503/504 会退避重试，多次仍失败则跳过并记入 `missing_pdfs.log`。
 - 存储：输出目录下按行业分子文件夹，其内直接存放年报 PDF；文件名为「公司名称-股票代码-年份.pdf」（行业来自新浪财经行业分类接口，缓存于 cache-dir/akshare/）。
@@ -80,11 +80,8 @@ REFRESH_CACHE: bool = False
 # 新浪财经行业划分（传给 akshare.stock_classify_sina）。常用「申万行业」「新浪行业」「申万二级」等；见 vip.stock.finance.sina.com.cn/mkt/
 SINA_INDUSTRY_CLASSIFY_SYMBOL: str = "申万行业"
 
-# 新浪对高频请求常返回 456（非标准码，多为限流/风控）。全脚本统一的随机休眠（秒）：
-# 实际 = PACE_SLEEP_MIN_SEC + Uniform(0, PACE_SLEEP_JITTER_SEC)，默认约 0.8～2.0。
-# 用于：两次成功 HTTP 网页之间的最小间隔（与 --http-interval/--http-jitter 默认一致）、
-# 股票阶段末与 PDF 成功后（--sleep/--sleep-jitter）、同只股票换报告期年份、PDF 网关/限流重试前。
-PACE_SLEEP_MIN_SEC: float = 0.8
+# 新浪对高频请求常返回 456（非标准码，多为限流/风控）。PACE_SLEEP_JITTER_SEC为浮动延时，总体延时默认1.2~2.4秒
+PACE_SLEEP_MIN_SEC: float = 1.2
 PACE_SLEEP_JITTER_SEC: float = 1.2
 # 下列状态在日志中会额外提示「常见于限流/网关」；PDF 下载会据此退避重试（见 download_pdf）；网页 http_get 仍 raise
 RETRYABLE_HTTP_STATUS: frozenset[int] = frozenset({456, 429, 502, 503, 504})
