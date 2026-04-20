@@ -10,8 +10,8 @@
 - PDF 输出根目录：常量 OUTPUT_DIR_STR（命令行 `--output` 可覆盖）；**PDF 原件**路径形如「输出根/行业/公司名-代码-报告期年份.pdf」（行业下不再有年份子目录）。
 - 新浪 PDF 若 404/410：在**同一输出根目录**追加写入 `missing_pdfs.log`（UTF-8 TSV，含代码、公告标题、PDF URL、目标路径等）。
 - 网络拉取均带 tqdm 字节/步骤进度条；`--no-progress` 可关闭。
-- 全脚本统一的节奏休眠（默认约 0.8～2.0 秒）：`PACE_SLEEP_MIN_SEC` + Uniform(0, `PACE_SLEEP_JITTER_SEC`)。用于：两次成功 **HTTP 网页** 之间的最小间隔（`--http-interval` / `--http-jitter` 默认与此相同）、**股票阶段末 / PDF 成功后**（`--sleep` / `--sleep-jitter`）、**同一只股票切换报告期年份**时、**PDF 遇限流/网关重试**前。
-- `--sleep` / `--sleep-jitter`：仅当该股本次「列表/详情」发生过真实 HTTP 时才在阶段末休眠，纯磁盘缓存则不睡；**下载 PDF 成功后**也按同一公式休眠。
+- 全脚本统一的节奏休眠（默认约 0.8～2.0 秒）：`PACE_SLEEP_MIN_SEC` + Uniform(0, `PACE_SLEEP_JITTER_SEC`)。用于：两次成功 **HTTP 网页** 之间的最小间隔（`--http-interval` / `--http-jitter` 默认与此相同）、**股票阶段末**（`--sleep` / `--sleep-jitter`，仅当列表/详情曾走 HTTP）、**同一只股票切换报告期年份**（仅当下一条详情将走网络而非命中 `http_get` 缓存）、**下载 PDF 成功后**（仅当本条公告详情曾走 HTTP）、**PDF 遇限流/网关重试**前。
+- `--sleep` / `--sleep-jitter`：凡命中磁盘缓存、未发 HTTP 的步骤不触发上述节奏休眠（`_pace_before_http` 本身也只在真正发请求前执行）。
 - 新浪可能返回 HTTP 456（非标准码，多为限流/风控）：网页请求间有最小间隔与抖动；**网页**遇 456/429/502/503 等会写日志并抛出（可调大 `--http-interval`）。**PDF 下载**遇 429/456/502/503/504 会退避重试，多次仍失败则跳过并记入 `missing_pdfs.log`。
 - 存储：输出目录下按行业分子文件夹，其内直接存放年报 PDF；文件名为「公司名称-股票代码-年份.pdf」（行业来自新浪财经行业分类接口，缓存于 cache-dir/akshare/）。
 - 断点续传：
@@ -250,6 +250,31 @@ class NetCache:
         if elapsed < gap:
             time.sleep(gap - elapsed)
 
+    def _http_get_url_is_disk_cached(self, url: str) -> bool:
+        """与 http_get_text 一致：未 refresh 且已有可读缓存文件时为 True。"""
+        if self.refresh:
+            return False
+        self._http_get_dir.mkdir(parents=True, exist_ok=True)
+        key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        cache_txt = self._http_get_dir / f"{key}.txt"
+        legacy_html = self._http_get_dir / f"{key}.html"
+        legacy_sina_html = self.root / "sina_html_cache"
+        if cache_txt.exists() or legacy_html.exists():
+            return True
+        for folder, suffix in (
+            (legacy_sina_html, ".txt"),
+            (legacy_sina_html, ".html"),
+        ):
+            if folder.is_dir():
+                leg = folder / f"{key}{suffix}"
+                if leg.exists():
+                    return True
+        return False
+
+    def http_get_would_use_network(self, url: str) -> bool:
+        """若下次对同一 URL 调用 http_get_text 会发 HTTP（非纯磁盘命中），则为 True。"""
+        return not self._http_get_url_is_disk_cached(url)
+
     def http_get_text(
         self,
         sess: requests.Session,
@@ -263,13 +288,12 @@ class NetCache:
 
         返回 (正文, used_http)：后者为 True 表示本次经历了 HTTP（非磁盘缓存命中）。
         """
-        self._http_get_dir.mkdir(parents=True, exist_ok=True)
-        key = hashlib.sha256(url.encode("utf-8")).hexdigest()
-        cache_txt = self._http_get_dir / f"{key}.txt"
-        cache_meta = self._http_get_dir / f"{key}.json"
-        legacy_html = self._http_get_dir / f"{key}.html"
-        legacy_sina_html = self.root / "sina_html_cache"
-        if not self.refresh:
+        if self._http_get_url_is_disk_cached(url):
+            self._http_get_dir.mkdir(parents=True, exist_ok=True)
+            key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+            cache_txt = self._http_get_dir / f"{key}.txt"
+            legacy_html = self._http_get_dir / f"{key}.html"
+            legacy_sina_html = self.root / "sina_html_cache"
             if cache_txt.exists():
                 return cache_txt.read_text(encoding="utf-8"), False
             if legacy_html.exists():
@@ -282,6 +306,11 @@ class NetCache:
                     leg = folder / f"{key}{suffix}"
                     if leg.exists():
                         return leg.read_text(encoding="utf-8"), False
+
+        self._http_get_dir.mkdir(parents=True, exist_ok=True)
+        key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        cache_txt = self._http_get_dir / f"{key}.txt"
+        cache_meta = self._http_get_dir / f"{key}.json"
 
         desc = progress_desc or f"HTTP {_short_url_desc(url)}"
         self._pace_before_http()
@@ -502,6 +531,13 @@ def fetch_ndbg_list_html(sess: requests.Session, code: str, cache: NetCache) -> 
     )
 
 
+def _canonical_bulletin_detail_url(detail_url: str) -> str:
+    """与 fetch_pdf_url 一致：公告详情页绝对 URL（用于缓存命中探测）。"""
+    if detail_url.startswith("/"):
+        return urljoin(SINA_HOST + "/", detail_url.lstrip("/"))
+    return detail_url
+
+
 def parse_ndbg_rows(html: str) -> list[tuple[str, str, str]]:
     """
     返回 [(公告日 YYYY-MM-DD, 详情相对或绝对 URL, 标题), ...]
@@ -554,8 +590,7 @@ def fetch_pdf_url(
     *,
     stock_code: str = "",
 ) -> tuple[Optional[str], bool]:
-    if detail_url.startswith("/"):
-        detail_url = urljoin(SINA_HOST + "/", detail_url.lstrip("/"))
+    detail_url = _canonical_bulletin_detail_url(detail_url)
     hint = f" {stock_code}" if stock_code else ""
     html, used_http = cache.http_get_text(
         sess,
@@ -751,12 +786,13 @@ def iter_jobs(
     year_end: int,
     output_root: Path,
     industry_by_code: Mapping[str, str],
-) -> Iterator[tuple[str, str, str, str, int, str, str]]:
+) -> Iterator[tuple[str, str, str, str, int, str, str, bool]]:
     """
-    产出 (code, name, industry, announce_date, year, title, pdf_url)。
+    产出 (code, name, industry, announce_date, year, title, pdf_url, detail_used_http)。
+    detail_used_http：本条公告详情是否走了 HTTP（False 表示命中 http_get 磁盘缓存）。
     仅包含报告期年份在 [year_start, year_end] 闭区间内的条目。
     对股票列表使用总进度条（与「共 N 只股票」一致）。
-    同一只股票上一条已产出任务与本条报告期年份不同时，在请求公告详情前按 sleep_min_sec + Uniform(0, sleep_jitter_sec) 额外休眠（默认与 PACE_SLEEP_* 一致）。
+    同一只股票换报告期年份时，仅当详情页将走网络时才在请求前按 sleep_min_sec + Uniform(0, sleep_jitter_sec) 额外休眠（纯缓存命中则不睡）。
     """
     stock_list = list(stocks)
     n_stocks = len(stock_list)
@@ -807,7 +843,10 @@ def iter_jobs(
                 if year < year_start or year > year_end:
                     continue
                 if last_report_year is not None and year != last_report_year:
-                    _sleep_stock_paced(sleep_min_sec, sleep_jitter_sec)
+                    if stock_sleep_on and cache.http_get_would_use_network(
+                        _canonical_bulletin_detail_url(href.strip())
+                    ):
+                        _sleep_stock_paced(sleep_min_sec, sleep_jitter_sec)
                 pdf_url, detail_used_http = fetch_pdf_url(sess, href, cache, stock_code=code)
                 stock_used_http = stock_used_http or detail_used_http
                 if not pdf_url:
@@ -815,7 +854,7 @@ def iter_jobs(
                     if stock_sleep_on and detail_used_http:
                         _sleep_stock_paced(sleep_min_sec, sleep_jitter_sec)
                     continue
-                yield code, name, industry, ann, year, title, pdf_url
+                yield code, name, industry, ann, year, title, pdf_url, detail_used_http
                 last_report_year = year
             if stock_sleep_on and stock_used_http:
                 _sleep_stock_paced(sleep_min_sec, sleep_jitter_sec)
@@ -974,7 +1013,7 @@ def main() -> None:
     industry_map = cache.load_code_industry_map()
 
     ok = skip = missing_pdf = 0
-    for code, name, industry, ann, year, title, pdf_url in iter_jobs(
+    for code, name, industry, ann, year, title, pdf_url, detail_used_http in iter_jobs(
         stocks,
         sess,
         args.sleep,
@@ -1005,7 +1044,8 @@ def main() -> None:
         )
         if download_pdf(sess, pdf_url, dest, progress_desc=f"{code} {year}"):
             ok += 1
-            _sleep_stock_paced(args.sleep, args.sleep_jitter)
+            if detail_used_http:
+                _sleep_stock_paced(args.sleep, args.sleep_jitter)
         else:
             missing_pdf += 1
             out_root = args.output.resolve()
