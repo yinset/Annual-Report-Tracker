@@ -10,8 +10,9 @@
 - PDF 输出根目录：常量 OUTPUT_DIR_STR（命令行 `--output` 可覆盖）；**PDF 原件**路径形如「输出根/行业/公司名-代码-报告期年份.pdf」（行业下不再有年份子目录）。
 - 新浪 PDF 若 404/410：在**同一输出根目录**追加写入 `missing_pdfs.log`（UTF-8 TSV，含代码、公告标题、PDF URL、目标路径等）。
 - 网络拉取均带 tqdm 字节/步骤进度条；`--no-progress` 可关闭。
-- `--sleep`（股票阶段末）：仅当该股本次「年报列表或公告详情」发生过真实 HTTP 时才休眠；若全文均命中磁盘缓存则不休眠。**下载 PDF 成功后**仍会按 `--sleep` 休眠一次（针对文件服务器）。
-- 新浪可能返回 HTTP 456（非标准码，多为限流/风控）：网页请求间有最小间隔与抖动；遇 456/429/502/503 等会**写日志并抛出**，请加大 `--http-interval` 与 `--sleep` 后重跑。
+- 全脚本统一的节奏休眠（默认约 0.8～2.0 秒）：`PACE_SLEEP_MIN_SEC` + Uniform(0, `PACE_SLEEP_JITTER_SEC`)。用于：两次成功 **HTTP 网页** 之间的最小间隔（`--http-interval` / `--http-jitter` 默认与此相同）、**股票阶段末 / PDF 成功后**（`--sleep` / `--sleep-jitter`）、**同一只股票切换报告期年份**时、**PDF 遇限流/网关重试**前。
+- `--sleep` / `--sleep-jitter`：仅当该股本次「列表/详情」发生过真实 HTTP 时才在阶段末休眠，纯磁盘缓存则不睡；**下载 PDF 成功后**也按同一公式休眠。
+- 新浪可能返回 HTTP 456（非标准码，多为限流/风控）：网页请求间有最小间隔与抖动；**网页**遇 456/429/502/503 等会写日志并抛出（可调大 `--http-interval`）。**PDF 下载**遇 429/456/502/503/504 会退避重试，多次仍失败则跳过并记入 `missing_pdfs.log`。
 - 存储：输出目录下按行业分子文件夹，其内直接存放年报 PDF；文件名为「公司名称-股票代码-年份.pdf」（行业来自新浪财经行业分类接口，缓存于 cache-dir/akshare/）。
 - 断点续传：
   - 已完成 PDF：目标 .pdf 已存在且大于 0 字节则跳过下载；若你设定的报告期年份区间内、该股票对应路径下的 PDF **全部**已存在，则**不再读取**该股年报列表（含缓存），以加快重跑；
@@ -79,14 +80,16 @@ REFRESH_CACHE: bool = False
 # 新浪财经行业划分（传给 akshare.stock_classify_sina）。常用「申万行业」「新浪行业」「申万二级」等；见 vip.stock.finance.sina.com.cn/mkt/
 SINA_INDUSTRY_CLASSIFY_SYMBOL: str = "申万行业"
 
-# 新浪对高频请求常返回 456（非标准码，多为限流/风控）。以下为「节流 + 重试」默认值，可调大更稳、更慢。
-# 两次成功 HTTP 拉取之间：间隔 = HTTP_MIN + Uniform(0, HTTP_JITTER)，即默认约 0.85～2.25 秒
-HTTP_MIN_INTERVAL_SEC: float = 0.85
-HTTP_JITTER_SEC: float = 1.4
-# 下列状态在日志中会额外提示「常见于限流/网关」；出现即记录日志并 raise，不重试
-RETRYABLE_HTTP_STATUS: frozenset[int] = frozenset({456, 429, 502, 503})
-# 每只股票在**发生过网页 HTTP**后的额外休眠（秒），纯读磁盘缓存时不生效；与 HTTP 间隔叠加，减轻整批压力
-DEFAULT_SLEEP_BETWEEN_STOCKS: float = 0.65
+# 新浪对高频请求常返回 456（非标准码，多为限流/风控）。全脚本统一的随机休眠（秒）：
+# 实际 = PACE_SLEEP_MIN_SEC + Uniform(0, PACE_SLEEP_JITTER_SEC)，默认约 0.8～2.0。
+# 用于：两次成功 HTTP 网页之间的最小间隔（与 --http-interval/--http-jitter 默认一致）、
+# 股票阶段末与 PDF 成功后（--sleep/--sleep-jitter）、同只股票换报告期年份、PDF 网关/限流重试前。
+PACE_SLEEP_MIN_SEC: float = 0.8
+PACE_SLEEP_JITTER_SEC: float = 1.2
+# 下列状态在日志中会额外提示「常见于限流/网关」；PDF 下载会据此退避重试（见 download_pdf）；网页 http_get 仍 raise
+RETRYABLE_HTTP_STATUS: frozenset[int] = frozenset({456, 429, 502, 503, 504})
+# 单条 PDF 遇网关/限流时的最大重试次数（每次失败后会 sleep 再发请求）
+PDF_TRANSIENT_HTTP_MAX_RETRIES: int = 12
 
 # 从公告标题解析「报告期」年度：如「2024年年度报告」「2024年度报告」
 _YEAR_TITLE = re.compile(r"(20\d{2})\s*年?\s*年度\s*报告")
@@ -106,6 +109,20 @@ _PDF_HREF = re.compile(
 _PROGRESS_ENABLED = True
 
 logger = logging.getLogger(__name__)
+
+
+def _pace_sleep_duration(min_sec: float, jitter_sec: float) -> float:
+    """统一节奏：下限 + 均匀抖动；二者均 <=0 则返回 0。"""
+    if min_sec <= 0 and jitter_sec <= 0:
+        return 0.0
+    return max(0.0, min_sec) + random.uniform(0.0, max(0.0, jitter_sec))
+
+
+def _sleep_stock_paced(min_sec: float, jitter_sec: float) -> None:
+    """按 min + Uniform(0, jitter) 休眠（与 PACE_SLEEP_* 及命令行参数同一套语义）。"""
+    duration = _pace_sleep_duration(min_sec, jitter_sec)
+    if duration > 0:
+        time.sleep(duration)
 
 
 def _log_http_failure(r: requests.Response, url: str) -> None:
@@ -211,8 +228,8 @@ class NetCache:
         root: Path,
         *,
         refresh: bool = False,
-        min_http_interval: float = HTTP_MIN_INTERVAL_SEC,
-        http_jitter: float = HTTP_JITTER_SEC,
+        min_http_interval: float = PACE_SLEEP_MIN_SEC,
+        http_jitter: float = PACE_SLEEP_JITTER_SEC,
     ) -> None:
         self.root = root
         self.refresh = refresh
@@ -600,6 +617,8 @@ def download_pdf(
     同一路径的 .part.meta.json 记录 URL，若与本次 PDF URL 不一致则清空分片重来。
 
     若服务端返回 404/410（对象存储上已无此文件），记录警告并返回 False，不抛异常。
+    若返回 429/456/502/503/504，按 PDF_TRANSIENT_HTTP_MAX_RETRIES 次重试，每次重试前休眠约 PACE_SLEEP_MIN_SEC～PACE_SLEEP_MIN_SEC+PACE_SLEEP_JITTER_SEC 秒；仍失败则记录错误并返回 False。
+    其它非成功状态仍 raise_for_status。
     成功落盘则返回 True。
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -619,6 +638,7 @@ def download_pdf(
             meta_path.unlink(missing_ok=True)
 
     attempts = 0
+    transient_tries = 0
     while True:
         attempts += 1
         if attempts > 5:
@@ -642,6 +662,32 @@ def download_pdf(
                 )
                 return False
             if r.status_code not in (200, 206):
+                if r.status_code in RETRYABLE_HTTP_STATUS:
+                    transient_tries += 1
+                    if transient_tries > PDF_TRANSIENT_HTTP_MAX_RETRIES:
+                        _log_http_failure(r, pdf_url)
+                        logger.error(
+                            "PDF 下载在 %s 次重试后仍失败（%s），跳过: %s",
+                            PDF_TRANSIENT_HTTP_MAX_RETRIES,
+                            r.status_code,
+                            pdf_url,
+                        )
+                        return False
+                    _log_http_failure(r, pdf_url)
+                    delay = _pace_sleep_duration(
+                        PACE_SLEEP_MIN_SEC, PACE_SLEEP_JITTER_SEC
+                    )
+                    logger.warning(
+                        "PDF HTTP %s 第 %s/%s 次重试前等待 %.1fs（节奏与 PACE_SLEEP_* 一致）",
+                        r.status_code,
+                        transient_tries,
+                        PDF_TRANSIENT_HTTP_MAX_RETRIES,
+                        delay,
+                    )
+                    if delay > 0:
+                        time.sleep(delay)
+                    attempts -= 1
+                    continue
                 _log_http_failure(r, pdf_url)
                 r.raise_for_status()
             # 206 为续传片段；200 为全量（含不支持 Range 时退回全文）
@@ -698,7 +744,8 @@ def download_pdf(
 def iter_jobs(
     stocks: Iterable[tuple[str, str]],
     sess: requests.Session,
-    sleep_sec: float,
+    sleep_min_sec: float,
+    sleep_jitter_sec: float,
     cache: NetCache,
     year_start: int,
     year_end: int,
@@ -709,10 +756,12 @@ def iter_jobs(
     产出 (code, name, industry, announce_date, year, title, pdf_url)。
     仅包含报告期年份在 [year_start, year_end] 闭区间内的条目。
     对股票列表使用总进度条（与「共 N 只股票」一致）。
+    同一只股票上一条已产出任务与本条报告期年份不同时，在请求公告详情前按 sleep_min_sec + Uniform(0, sleep_jitter_sec) 额外休眠（默认与 PACE_SLEEP_* 一致）。
     """
     stock_list = list(stocks)
     n_stocks = len(stock_list)
     out_root = output_root.resolve()
+    stock_sleep_on = sleep_min_sec > 0 or sleep_jitter_sec > 0
     with _tqdm(
         total=n_stocks,
         desc="沪深主板股票",
@@ -742,12 +791,13 @@ def iter_jobs(
                     code,
                     name,
                 )
-                if sleep_sec > 0 and list_used_http:
-                    time.sleep(sleep_sec)
+                if stock_sleep_on and list_used_http:
+                    _sleep_stock_paced(sleep_min_sec, sleep_jitter_sec)
                 stock_pbar.update(1)
                 continue
 
             stock_used_http = list_used_http
+            last_report_year: Optional[int] = None
             for ann, href, title in rows:
                 if not is_full_annual_report_title(title):
                     continue
@@ -756,16 +806,19 @@ def iter_jobs(
                     continue
                 if year < year_start or year > year_end:
                     continue
+                if last_report_year is not None and year != last_report_year:
+                    _sleep_stock_paced(sleep_min_sec, sleep_jitter_sec)
                 pdf_url, detail_used_http = fetch_pdf_url(sess, href, cache, stock_code=code)
                 stock_used_http = stock_used_http or detail_used_http
                 if not pdf_url:
                     logger.info("[无PDF] %s %s", code, title[:50])
-                    if sleep_sec > 0 and detail_used_http:
-                        time.sleep(sleep_sec)
+                    if stock_sleep_on and detail_used_http:
+                        _sleep_stock_paced(sleep_min_sec, sleep_jitter_sec)
                     continue
                 yield code, name, industry, ann, year, title, pdf_url
-            if sleep_sec > 0 and stock_used_http:
-                time.sleep(sleep_sec)
+                last_report_year = year
+            if stock_sleep_on and stock_used_http:
+                _sleep_stock_paced(sleep_min_sec, sleep_jitter_sec)
             stock_pbar.update(1)
 
 
@@ -807,20 +860,26 @@ def main() -> None:
     parser.add_argument(
         "--sleep",
         type=float,
-        default=DEFAULT_SLEEP_BETWEEN_STOCKS,
-        help="反爬：仅当该股本次列表/详情发生过 HTTP 时在阶段末休眠（秒）；纯磁盘缓存则不睡（默认取 DEFAULT_SLEEP_BETWEEN_STOCKS）",
+        default=PACE_SLEEP_MIN_SEC,
+        help="反爬：股票阶段末 / PDF 成功后休眠的下限（秒），另加 --sleep-jitter；与 PACE_SLEEP_* 默认一致（约 0.8～2.0）",
+    )
+    parser.add_argument(
+        "--sleep-jitter",
+        type=float,
+        default=PACE_SLEEP_JITTER_SEC,
+        help="反爬：在 --sleep 上额外均匀随机 0～本值（秒）；与 --sleep 默认合计约 0.8～2.0（同 PACE_SLEEP_JITTER_SEC）",
     )
     parser.add_argument(
         "--http-interval",
         type=float,
-        default=HTTP_MIN_INTERVAL_SEC,
-        help="两次成功 HTTP 网页请求之间的最小间隔秒数，另加随机抖动（减轻新浪 456 限流）",
+        default=PACE_SLEEP_MIN_SEC,
+        help="两次成功 HTTP 网页请求之间的最小间隔（秒），另加 --http-jitter；默认与 PACE_SLEEP_MIN_SEC 一致",
     )
     parser.add_argument(
         "--http-jitter",
         type=float,
-        default=HTTP_JITTER_SEC,
-        help="HTTP 间隔上额外随机抖动上限（秒）",
+        default=PACE_SLEEP_JITTER_SEC,
+        help="HTTP 间隔上额外随机抖动上限（秒）；默认与 PACE_SLEEP_JITTER_SEC 一致",
     )
     parser.add_argument(
         "--limit",
@@ -919,6 +978,7 @@ def main() -> None:
         stocks,
         sess,
         args.sleep,
+        args.sleep_jitter,
         cache,
         year_start,
         year_end,
@@ -945,13 +1005,13 @@ def main() -> None:
         )
         if download_pdf(sess, pdf_url, dest, progress_desc=f"{code} {year}"):
             ok += 1
-            time.sleep(args.sleep)
+            _sleep_stock_paced(args.sleep, args.sleep_jitter)
         else:
             missing_pdf += 1
             out_root = args.output.resolve()
             _append_missing_pdf_log(
                 out_root,
-                reason="404/410",
+                reason="404/410 或 PDF 多次重试仍失败",
                 code=code,
                 name=name,
                 industry=industry,
@@ -962,7 +1022,7 @@ def main() -> None:
                 dest_path=dest,
             )
 
-    logger.info("完成。成功: %s, 跳过: %s, PDF 缺失(404/410): %s", ok, skip, missing_pdf)
+    logger.info("完成。成功: %s, 跳过: %s, PDF 缺失或下载失败: %s", ok, skip, missing_pdf)
     if missing_pdf:
         logger.info("缺失明细文件: %s", args.output.resolve() / MISSING_PDF_LOG_FILENAME)
 
