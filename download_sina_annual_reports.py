@@ -63,11 +63,10 @@ DEFAULT_UA = (
 # ---------------------------------------------------------------------------
 # 运行策略（可直接改这里；命令行参数若给出则覆盖对应项）
 # ---------------------------------------------------------------------------
-_cy = date.today().year
-_default_report_year = _cy - 1
-# 年报「报告期」年份闭区间；默认「本年-1」；历史区间如 2018～2023 可改起止
-REPORT_YEAR_START: int = 2025
-REPORT_YEAR_END: int = 2025
+_default_report_year = 2025
+# 年报「报告期」年份闭区间；历史区间如 2020～2025 可改起止
+REPORT_YEAR_START: int = _default_report_year
+REPORT_YEAR_END: int = _default_report_year
 
 # 网络缓存根目录（其下含 `http_get/` 网页快照、`akshare/` 证券列表缓存；可为绝对路径）
 CACHE_DIR_STR: str = r"D:\Annual-Report-Tracker\.cache\sina_annual_reports"
