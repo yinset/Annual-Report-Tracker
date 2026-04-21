@@ -8,7 +8,8 @@
 - 缓存目录与是否刷新缓存：常量 CACHE_DIR_STR、REFRESH_CACHE（命令行可覆盖）。
   **重要**：`--cache-dir` 下 `http_get/` 仅存**新浪网页正文**（`<sha256>.txt` UTF-8，配套同名 `.json` 元数据；用于解析 PDF 链接），**不是**年报 PDF 原件。
 - PDF 输出根目录：常量 OUTPUT_DIR_STR（命令行 `--output` 可覆盖）；**PDF 原件**路径形如「输出根/行业/公司名-代码-报告期年份.pdf」（行业下不再有年份子目录）。
-- 新浪 PDF 若 404/410：在**同一输出根目录**追加写入 `missing_pdfs.log`（UTF-8 TSV，含代码、公告标题、PDF URL、目标路径等）。
+- 新浪 PDF 若 404/410：在**同一输出根目录**追加写入 `missing_pdfs.log`（UTF-8 TSV；`简称` 后有一列 `文件名`，值为「简称-代码-报告期年份」，与 PDF 主文件名一致）。
+- 运行中出现 `[无列表]`、`[无PDF]` 时，在输出根目录追加 `skip_list_pdf_events.log`（UTF-8 TSV；同上含 `文件名` 列；无报告期年份时该列为「简称-代码-」）。
 - 网络拉取均带 tqdm 字节/步骤进度条；`--no-progress` 可关闭。
 - 全脚本统一的节奏休眠：`PACE_SLEEP_MIN_SEC` + Uniform(0, `PACE_SLEEP_JITTER_SEC`)。用于：两次成功 **HTTP 网页** 之间的最小间隔（`--http-interval` / `--http-jitter` 默认与此相同）、**股票阶段末**（`--sleep` / `--sleep-jitter`，仅当列表/详情曾走 HTTP）、**同一只股票切换报告期年份**（仅当下一条详情将走网络而非命中 `http_get` 缓存）、**下载 PDF 成功后**（仅当本条公告详情曾走 HTTP）、**PDF 遇限流/网关重试**前。
 - `--sleep` / `--sleep-jitter`：凡命中磁盘缓存、未发 HTTP 的步骤不触发上述节奏休眠（`_pace_before_http` 本身也只在真正发请求前执行）。
@@ -65,8 +66,8 @@ DEFAULT_UA = (
 _cy = date.today().year
 _default_report_year = _cy - 1
 # 年报「报告期」年份闭区间；默认「本年-1」；历史区间如 2018～2023 可改起止
-REPORT_YEAR_START: int = _default_report_year
-REPORT_YEAR_END: int = _default_report_year
+REPORT_YEAR_START: int = 2020
+REPORT_YEAR_END: int = 2025
 
 # 网络缓存根目录（其下含 `http_get/` 网页快照、`akshare/` 证券列表缓存；可为绝对路径）
 CACHE_DIR_STR: str = r"D:\Annual-Report-Tracker\.cache\sina_annual_reports"
@@ -74,6 +75,8 @@ CACHE_DIR_STR: str = r"D:\Annual-Report-Tracker\.cache\sina_annual_reports"
 OUTPUT_DIR_STR: str = r"D:\Annual_Report_Output"
 # 新浪 PDF 404/410 等缺失时追加写入输出根目录（与 --output 一致，默认即 D:\\Annual_Report_Output）
 MISSING_PDF_LOG_FILENAME: str = "missing_pdfs.log"
+# [无列表] / [无PDF] 等跳过说明追加写入输出根目录（UTF-8 TSV）
+SKIP_EVENTS_LOG_FILENAME: str = "skip_list_pdf_events.log"
 # 为 True 时忽略 HTTP/akshare 磁盘缓存，强制重新请求（不删除已完成的 PDF）
 REFRESH_CACHE: bool = False
 
@@ -165,14 +168,17 @@ def _append_missing_pdf_log(
         return s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
 
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    name_f = _flat(name)
+    y = str(year)
     fields = [
         ts,
         reason,
         code,
-        _flat(name),
+        name_f,
+        _flat(f"{name_f}-{code}-{y}"),
         _flat(industry),
         announce_date,
-        str(year),
+        y,
         _flat(title),
         pdf_url,
         str(dest_path.resolve()),
@@ -181,7 +187,53 @@ def _append_missing_pdf_log(
     with path.open("a", encoding="utf-8") as f:
         if f.tell() == 0:
             f.write(
-                "时间\t原因\t代码\t简称\t行业\t公告日期\t报告期年份\t公告标题\tPDF_URL\t目标路径\n"
+                "时间\t原因\t代码\t简称\t文件名\t行业\t公告日期\t报告期年份\t公告标题\tPDF_URL\t目标路径\n"
+            )
+        f.write(line)
+
+
+def _append_skip_event_log(
+    output_root: Path,
+    *,
+    event: str,
+    code: str,
+    name: str,
+    industry: str,
+    announce_date: str = "",
+    report_year: str = "",
+    title: str = "",
+    related_url: str = "",
+    note: str = "",
+) -> None:
+    """将 [无列表] / [无PDF] 等一条追加到输出根目录下的 SKIP_EVENTS_LOG_FILENAME（UTF-8 TSV）。"""
+    root = output_root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / SKIP_EVENTS_LOG_FILENAME
+
+    def _flat(s: str) -> str:
+        return s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    name_f = _flat(name)
+    file_stem = _flat(f"{name_f}-{code}-{report_year}")
+    fields = [
+        ts,
+        _flat(event),
+        code,
+        name_f,
+        file_stem,
+        _flat(industry),
+        announce_date,
+        report_year,
+        _flat(title),
+        related_url,
+        _flat(note),
+    ]
+    line = "\t".join(fields) + "\n"
+    with path.open("a", encoding="utf-8") as f:
+        if f.tell() == 0:
+            f.write(
+                "时间\t事件\t代码\t简称\t文件名\t行业\t公告日期\t报告期年份\t公告标题\t相关URL\t备注\n"
             )
         f.write(line)
 
@@ -834,6 +886,15 @@ def iter_jobs(
                     code,
                     name,
                 )
+                _append_skip_event_log(
+                    out_root,
+                    event="无列表",
+                    code=code,
+                    name=name,
+                    industry=industry,
+                    related_url=BULLETIN_NDBG.format(code=code),
+                    note="未解析到 datelist，可能无公告或页面变更",
+                )
                 if stock_sleep_on and list_used_http:
                     _sleep_stock_paced(sleep_min_sec, sleep_jitter_sec)
                 stock_pbar.update(1)
@@ -876,6 +937,18 @@ def iter_jobs(
                         )
                 if not pdf_url:
                     logger.info("[无PDF] %s %s", code, title[:50])
+                    _append_skip_event_log(
+                        out_root,
+                        event="无PDF",
+                        code=code,
+                        name=name,
+                        industry=industry,
+                        announce_date=ann,
+                        report_year=str(year),
+                        title=title,
+                        related_url=_canonical_bulletin_detail_url(href.strip()),
+                        note="详情页未解析到 PDF 链接（含缓存重拉后仍无）",
+                    )
                     if stock_sleep_on and detail_used_http:
                         _sleep_stock_paced(sleep_min_sec, sleep_jitter_sec)
                     continue
@@ -1088,8 +1161,12 @@ def main() -> None:
             )
 
     logger.info("完成。成功: %s, 跳过: %s, PDF 缺失或下载失败: %s", ok, skip, missing_pdf)
+    out_r = args.output.resolve()
     if missing_pdf:
-        logger.info("缺失明细文件: %s", args.output.resolve() / MISSING_PDF_LOG_FILENAME)
+        logger.info("缺失明细文件: %s", out_r / MISSING_PDF_LOG_FILENAME)
+    skip_events_path = out_r / SKIP_EVENTS_LOG_FILENAME
+    if skip_events_path.exists():
+        logger.info("无列表/无PDF 明细文件: %s", skip_events_path)
 
 
 if __name__ == "__main__":
