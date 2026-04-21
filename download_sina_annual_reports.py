@@ -8,8 +8,8 @@
 - 缓存目录与是否刷新缓存：常量 CACHE_DIR_STR、REFRESH_CACHE（命令行可覆盖）。
   **重要**：`--cache-dir` 下 `http_get/` 仅存**新浪网页正文**（`<sha256>.txt` UTF-8，配套同名 `.json` 元数据；用于解析 PDF 链接），**不是**年报 PDF 原件。
 - PDF 输出根目录：常量 OUTPUT_DIR_STR（命令行 `--output` 可覆盖）；**PDF 原件**路径形如「输出根/行业/公司名-代码-报告期年份.pdf」（行业下不再有年份子目录）。
-- 新浪 PDF 若 404/410：在**同一输出根目录**追加写入 `missing_pdfs.log`（UTF-8 TSV；`简称` 后有一列 `文件名`，值为「简称-代码-报告期年份」，与 PDF 主文件名一致）。
-- 运行中出现 `[无列表]`、`[无PDF]` 时，在输出根目录追加 `skip_list_pdf_events.log`（UTF-8 TSV；同上含 `文件名` 列；无报告期年份时该列为「简称-代码-」）。
+- 新浪 PDF 若 404/410：在**同一输出根目录**追加写入 `missing_pdfs.log`（UTF-8 TSV；`简称` 后有一列 `文件名`，值为「简称-代码-报告期年份.pdf」，与磁盘上的 PDF 文件名一致）。
+- 运行中出现 `[无列表]`、`[无PDF]` 时，在输出根目录追加 `skip_list_pdf_events.log`（UTF-8 TSV；同上含 `文件名` 列；无报告期年份时为「简称-代码-.pdf」）。
 - 网络拉取均带 tqdm 字节/步骤进度条；`--no-progress` 可关闭。
 - 全脚本统一的节奏休眠：`PACE_SLEEP_MIN_SEC` + Uniform(0, `PACE_SLEEP_JITTER_SEC`)。用于：两次成功 **HTTP 网页** 之间的最小间隔（`--http-interval` / `--http-jitter` 默认与此相同）、**股票阶段末**（`--sleep` / `--sleep-jitter`，仅当列表/详情曾走 HTTP）、**同一只股票切换报告期年份**（仅当下一条详情将走网络而非命中 `http_get` 缓存）、**下载 PDF 成功后**（仅当本条公告详情曾走 HTTP）、**PDF 遇限流/网关重试**前。
 - `--sleep` / `--sleep-jitter`：凡命中磁盘缓存、未发 HTTP 的步骤不触发上述节奏休眠（`_pace_before_http` 本身也只在真正发请求前执行）。
@@ -66,8 +66,8 @@ DEFAULT_UA = (
 _cy = date.today().year
 _default_report_year = _cy - 1
 # 年报「报告期」年份闭区间；默认「本年-1」；历史区间如 2018～2023 可改起止
-REPORT_YEAR_START: int = 2020
-REPORT_YEAR_END: int = 2025
+REPORT_YEAR_START: int = 2023
+REPORT_YEAR_END: int = 2023
 
 # 网络缓存根目录（其下含 `http_get/` 网页快照、`akshare/` 证券列表缓存；可为绝对路径）
 CACHE_DIR_STR: str = r"D:\Annual-Report-Tracker\.cache\sina_annual_reports"
@@ -175,7 +175,7 @@ def _append_missing_pdf_log(
         reason,
         code,
         name_f,
-        _flat(f"{name_f}-{code}-{y}"),
+        _flat(f"{name_f}-{code}-{y}.pdf"),
         _flat(industry),
         announce_date,
         y,
@@ -215,7 +215,7 @@ def _append_skip_event_log(
 
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     name_f = _flat(name)
-    file_stem = _flat(f"{name_f}-{code}-{report_year}")
+    file_stem = _flat(f"{name_f}-{code}-{report_year}.pdf")
     fields = [
         ts,
         _flat(event),
