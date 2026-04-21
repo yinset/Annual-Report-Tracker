@@ -5,13 +5,13 @@
 - 股票范围：上证主板 A 股 + 深证主板 A 股（不含科创板、创业板、B 股、北交所；由 akshare 官方列表筛选）。
 - 报告期年份：由文件顶部常量 REPORT_YEAR_START / REPORT_YEAR_END 控制（默认均为当前日历年减 1，与常见披露节奏一致），也可用命令行 --year-start / --year-end 覆盖。
 - 公告标题：须含「年」字；含「摘要」的条目不下载。
-- 缓存目录与是否刷新缓存：常量 CACHE_DIR_STR、REFRESH_CACHE（命令行可覆盖）。
+- 缓存目录与是否刷新缓存：常量 CACHE_DIR_STR、REFRESH_CACHE（命令行 `--refresh` / `--no-refresh` 可覆盖）。
   **重要**：`--cache-dir` 下 `http_get/` 仅存**新浪网页正文**（`<sha256>.txt` UTF-8，配套同名 `.json` 元数据；用于解析 PDF 链接），**不是**年报 PDF 原件。
 - PDF 输出根目录：常量 OUTPUT_DIR_STR（命令行 `--output` 可覆盖）；**PDF 原件**路径形如「输出根/行业/公司名-代码-报告期年份.pdf」（行业下不再有年份子目录）。
 - 新浪 PDF 若 404/410：在**同一输出根目录**追加写入 `missing_pdfs.log`（UTF-8 TSV；`简称` 后有一列 `文件名`，值为「简称-代码-报告期年份.pdf」，与磁盘上的 PDF 文件名一致）。
 - 运行中出现 `[无列表]`、`[无PDF]` 时，在输出根目录追加 `skip_list_pdf_events.log`（UTF-8 TSV；同上含 `文件名` 列；无报告期年份时为「简称-代码-.pdf」）。
 - 网络拉取均带 tqdm 字节/步骤进度条；`--no-progress` 可关闭。
-- 全脚本统一的节奏休眠：`PACE_SLEEP_MIN_SEC` + Uniform(0, `PACE_SLEEP_JITTER_SEC`)。用于：两次成功 **HTTP 网页** 之间的最小间隔（`--http-interval` / `--http-jitter` 默认与此相同）、**股票阶段末**（`--sleep` / `--sleep-jitter`，仅当列表/详情曾走 HTTP）、**同一只股票切换报告期年份**（仅当下一条详情将走网络而非命中 `http_get` 缓存）、**下载 PDF 成功后**（仅当本条公告详情曾走 HTTP）、**PDF 遇限流/网关重试**前。
+- 全脚本统一的节奏休眠：`PACE_SLEEP_MIN_SEC` + Uniform(0, `PACE_SLEEP_JITTER_SEC`)。用于：两次成功 **HTTP 网页** 之间的最小间隔（`--http-interval` / `--http-jitter` 默认与此相同）、**股票阶段末**（`--sleep` / `--sleep-jitter`，仅当列表/详情曾走 HTTP）、**同一只股票切换报告期年份**（仅当下一条详情将走网络而非命中 `http_get` 缓存）、**下载 PDF 成功后**（仅当本条公告详情曾走 HTTP）、**PDF 遇限流/网关重试**前；**`--refresh` 作废无效 http 磁盘或空 akshare 缓存后重拉前**另有一次固定 `PACE_SLEEP_*` 保底休眠（不受 `--sleep`/`--http-interval` 置零影响）。
 - `--sleep` / `--sleep-jitter`：凡命中磁盘缓存、未发 HTTP 的步骤不触发上述节奏休眠（`_pace_before_http` 本身也只在真正发请求前执行）。
 - 新浪可能返回 HTTP 456（非标准码，多为限流/风控）：网页请求间有最小间隔与抖动；**网页**遇 456/429/502/503 等会写日志并抛出（可调大 `--http-interval`）。**PDF 下载**遇 429/456/502/503/504 会退避重试，多次仍失败则跳过并记入 `missing_pdfs.log`。
 - 存储：输出目录下按行业分子文件夹，其内直接存放年报 PDF；文件名为「公司名称-股票代码-年份.pdf」（行业来自新浪财经行业分类接口，缓存于 cache-dir/akshare/）。
@@ -19,7 +19,7 @@
   - 已完成 PDF：目标 .pdf 已存在且大于 0 字节则跳过下载；若你设定的报告期年份区间内、该股票对应路径下的 PDF **全部**已存在，则**不再读取**该股年报列表（含缓存），以加快重跑；
   - 未完成 PDF：使用 .pdf.part + HTTP Range 续传；
   - 公告列表/详情页：写入 `cache-dir/http_get/`（`<sha256>.txt` + `.json`；便于断点续跑），**与 PDF 输出路径无关**；若详情命中缓存但解析不到 PDF，会先按 `--sleep` 节奏休眠再强制发 HTTP 刷新详情，仍无 PDF 则跳过。
-  - akshare 拉取的股票列表 / 代码简称映射：默认落盘缓存，命中则不再请求网络。
+  - akshare 拉取的股票列表 / 行业 / 代码简称映射：默认落盘缓存，命中则不再请求网络；`--refresh` 时仅当对应 JSON 为空（无列表/无映射）才重拉并覆盖。
 
 依赖：akshare（仅用于拉取证券列表）、requests（抓取新浪页面与 PDF）、tqdm（进度条）、logging（错误与运行日志）。
 """
@@ -36,7 +36,7 @@ import sys
 import time
 from datetime import date
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Optional
+from typing import Any, Iterable, Iterator, Literal, Mapping, Optional
 from urllib.parse import urljoin, urlparse
 
 import pandas as pd
@@ -66,8 +66,8 @@ DEFAULT_UA = (
 _cy = date.today().year
 _default_report_year = _cy - 1
 # 年报「报告期」年份闭区间；默认「本年-1」；历史区间如 2018～2023 可改起止
-REPORT_YEAR_START: int = 2023
-REPORT_YEAR_END: int = 2023
+REPORT_YEAR_START: int = 2025
+REPORT_YEAR_END: int = 2025
 
 # 网络缓存根目录（其下含 `http_get/` 网页快照、`akshare/` 证券列表缓存；可为绝对路径）
 CACHE_DIR_STR: str = r"D:\Annual-Report-Tracker\.cache\sina_annual_reports"
@@ -77,8 +77,8 @@ OUTPUT_DIR_STR: str = r"D:\Annual_Report_Output"
 MISSING_PDF_LOG_FILENAME: str = "missing_pdfs.log"
 # [无列表] / [无PDF] 等跳过说明追加写入输出根目录（UTF-8 TSV）
 SKIP_EVENTS_LOG_FILENAME: str = "skip_list_pdf_events.log"
-# 为 True 时忽略 HTTP/akshare 磁盘缓存，强制重新请求（不删除已完成的 PDF）
-REFRESH_CACHE: bool = False
+# 为 True 时仅忽略「无列表」的年报列表页缓存与「无 PDF」的公告详情页缓存，并忽略 akshare 侧空结果缓存；重拉后覆盖 http_get/akshare 文件，不删除已落盘的 PDF
+REFRESH_CACHE: bool = True
 
 # 新浪财经行业划分（传给 akshare.stock_classify_sina）。常用「申万行业」「新浪行业」「申万二级」等；见 vip.stock.finance.sina.com.cn/mkt/
 SINA_INDUSTRY_CLASSIFY_SYMBOL: str = "申万行业"
@@ -123,6 +123,11 @@ def _sleep_stock_paced(min_sec: float, jitter_sec: float) -> None:
     duration = _pace_sleep_duration(min_sec, jitter_sec)
     if duration > 0:
         time.sleep(duration)
+
+
+def _sleep_refresh_retry_paced() -> None:
+    """refresh 作废无效 http/空 akshare 缓存后、重拉网络前保底节奏（固定 PACE_SLEEP_*，不受 --sleep/--http-interval 置零影响）。"""
+    _sleep_stock_paced(PACE_SLEEP_MIN_SEC, PACE_SLEEP_JITTER_SEC)
 
 
 def _log_http_failure(r: requests.Response, url: str) -> None:
@@ -269,7 +274,9 @@ def _parse_content_range_total(content_range: str) -> Optional[int]:
 class NetCache:
     """
     统一管理：HTTP 文本缓存、akshare 结果缓存。
-    refresh=True 时跳过一切磁盘命中，强制走网络并覆盖缓存。
+    refresh=True 时：仅不把「解析不到公告列表」的列表页缓存与「解析不到 PDF 链接」的详情页缓存当作命中，
+    强制重拉并覆盖 http_get；此类重拉与 akshare 空缓存重拉前另有一次固定 PACE_SLEEP_* 休眠，再叠加 `_pace_before_http`。
+    其余 HTTP 与 akshare 非空结果仍用磁盘缓存。不触碰 PDF 输出目录。
     """
 
     def __init__(
@@ -299,17 +306,17 @@ class NetCache:
         if elapsed < gap:
             time.sleep(gap - elapsed)
 
-    def _http_get_url_is_disk_cached(self, url: str) -> bool:
-        """与 http_get_text 一致：未 refresh 且已有可读缓存文件时为 True。"""
-        if self.refresh:
-            return False
+    def _read_http_get_disk_text(self, url: str) -> Optional[str]:
+        """若存在与 http_get_text 一致的磁盘正文则返回 str，否则 None。"""
         self._http_get_dir.mkdir(parents=True, exist_ok=True)
         key = hashlib.sha256(url.encode("utf-8")).hexdigest()
         cache_txt = self._http_get_dir / f"{key}.txt"
         legacy_html = self._http_get_dir / f"{key}.html"
         legacy_sina_html = self.root / "sina_html_cache"
-        if cache_txt.exists() or legacy_html.exists():
-            return True
+        if cache_txt.exists():
+            return cache_txt.read_text(encoding="utf-8")
+        if legacy_html.exists():
+            return legacy_html.read_text(encoding="utf-8")
         for folder, suffix in (
             (legacy_sina_html, ".txt"),
             (legacy_sina_html, ".html"),
@@ -317,12 +324,35 @@ class NetCache:
             if folder.is_dir():
                 leg = folder / f"{key}{suffix}"
                 if leg.exists():
-                    return True
-        return False
+                    return leg.read_text(encoding="utf-8")
+        return None
 
-    def http_get_would_use_network(self, url: str) -> bool:
-        """若下次对同一 URL 调用 http_get_text 会发 HTTP（非纯磁盘命中），则为 True。"""
-        return not self._http_get_url_is_disk_cached(url)
+    def _http_get_disk_hit_ok(
+        self,
+        text: str,
+        *,
+        cache_kind: Optional[Literal["ndbg_list", "bulletin_detail"]] = None,
+    ) -> bool:
+        """在已有磁盘正文的前提下，本次是否允许当作命中（不发起 HTTP）。"""
+        if not self.refresh:
+            return True
+        if cache_kind is None:
+            return True
+        if cache_kind == "ndbg_list":
+            return bool(parse_ndbg_rows(text))
+        return _pdf_url_from_detail_html(text) is not None
+
+    def http_get_would_use_network(
+        self,
+        url: str,
+        *,
+        cache_kind: Optional[Literal["ndbg_list", "bulletin_detail"]] = None,
+    ) -> bool:
+        """若下次以相同 cache_kind 调用 http_get_text 会发 HTTP（非可接受的磁盘命中），则为 True。"""
+        text = self._read_http_get_disk_text(url)
+        if text is None:
+            return True
+        return not self._http_get_disk_hit_ok(text, cache_kind=cache_kind)
 
     def http_get_text(
         self,
@@ -333,30 +363,31 @@ class NetCache:
         timeout: int = 60,
         progress_desc: Optional[str] = None,
         force_network: bool = False,
+        cache_kind: Optional[Literal["ndbg_list", "bulletin_detail"]] = None,
     ) -> tuple[str, bool]:
         """GET 网页并解码为 str；网络拉取时显示字节进度条；正文以 UTF-8 写入 `http_get/<sha>.txt`，元数据写入同名 `.json`。
 
         返回 (正文, used_http)：后者为 True 表示本次经历了 HTTP（非磁盘缓存命中）。
         force_network=True 时跳过磁盘命中，直接请求并覆盖缓存（用于缓存正文无 PDF 时的再校验）。
+        cache_kind：refresh 模式下用于判断磁盘正文是否为「无列表 / 无 PDF」类无效缓存；为 None 时 refresh 仍保留该 URL 的磁盘命中。
         """
-        if not force_network and self._http_get_url_is_disk_cached(url):
-            self._http_get_dir.mkdir(parents=True, exist_ok=True)
-            key = hashlib.sha256(url.encode("utf-8")).hexdigest()
-            cache_txt = self._http_get_dir / f"{key}.txt"
-            legacy_html = self._http_get_dir / f"{key}.html"
-            legacy_sina_html = self.root / "sina_html_cache"
-            if cache_txt.exists():
-                return cache_txt.read_text(encoding="utf-8"), False
-            if legacy_html.exists():
-                return legacy_html.read_text(encoding="utf-8"), False
-            for folder, suffix in (
-                (legacy_sina_html, ".txt"),
-                (legacy_sina_html, ".html"),
+        refresh_invalid_disk = False
+        if not force_network:
+            disk_text = self._read_http_get_disk_text(url)
+            if disk_text is not None and self._http_get_disk_hit_ok(
+                disk_text, cache_kind=cache_kind
             ):
-                if folder.is_dir():
-                    leg = folder / f"{key}{suffix}"
-                    if leg.exists():
-                        return leg.read_text(encoding="utf-8"), False
+                return disk_text, False
+            if (
+                self.refresh
+                and cache_kind is not None
+                and disk_text is not None
+                and not self._http_get_disk_hit_ok(disk_text, cache_kind=cache_kind)
+            ):
+                refresh_invalid_disk = True
+
+        if refresh_invalid_disk:
+            _sleep_refresh_retry_paced()
 
         self._http_get_dir.mkdir(parents=True, exist_ok=True)
         key = hashlib.sha256(url.encode("utf-8")).hexdigest()
@@ -401,9 +432,12 @@ class NetCache:
     def load_mainboard_stocks(self) -> list[tuple[str, str]]:
         """缓存全市场主板列表（akshare 两次请求）。"""
         path = self._ak_dir / "mainboard_stocks.json"
-        if not self.refresh and path.exists():
+        if path.exists():
             raw = json.loads(path.read_text(encoding="utf-8"))
-            return [(str(x[0]).zfill(6), str(x[1])) for x in raw]
+            data = [(str(x[0]).zfill(6), str(x[1])) for x in raw]
+            if not self.refresh or data:
+                return data
+            _sleep_refresh_retry_paced()
 
         self._ak_dir.mkdir(parents=True, exist_ok=True)
         data = _load_mainboard_stocks_uncached()
@@ -416,9 +450,12 @@ class NetCache:
     def load_code_industry_map(self) -> dict[str, str]:
         """新浪财经行业分类 → 六位代码→行业名称（全市场拉取一次，磁盘缓存）。"""
         path = self._ak_dir / "stock_code_industry_sina.json"
-        if not self.refresh and path.exists():
+        if path.exists():
             raw = json.loads(path.read_text(encoding="utf-8"))
-            return {str(k).zfill(6): str(v) for k, v in raw.items()}
+            m = {str(k).zfill(6): str(v) for k, v in raw.items()}
+            if not self.refresh or m:
+                return m
+            _sleep_refresh_retry_paced()
 
         self._ak_dir.mkdir(parents=True, exist_ok=True)
         data = _load_code_industry_map_uncached()
@@ -431,9 +468,12 @@ class NetCache:
             return {}
         sig = hashlib.sha256(",".join(sorted(c.zfill(6) for c in codes)).encode()).hexdigest()[:16]
         path = self._ak_dir / f"names_{sig}.json"
-        if not self.refresh and path.exists():
+        if path.exists():
             d = json.loads(path.read_text(encoding="utf-8"))
-            return {str(k).zfill(6): str(v) for k, v in d.items()}
+            found = {str(k).zfill(6): str(v) for k, v in d.items()}
+            if not self.refresh or found:
+                return found
+            _sleep_refresh_retry_paced()
 
         self._ak_dir.mkdir(parents=True, exist_ok=True)
         found = _lookup_mainboard_names_uncached(codes)
@@ -579,6 +619,7 @@ def fetch_ndbg_list_html(sess: requests.Session, code: str, cache: NetCache) -> 
         response_encoding="gb18030",
         timeout=60,
         progress_desc=f"年报列表 {code}",
+        cache_kind="ndbg_list",
     )
 
 
@@ -666,6 +707,7 @@ def fetch_pdf_url(
         timeout=60,
         progress_desc=f"公告详情{hint}",
         force_network=force_network,
+        cache_kind="bulletin_detail",
     )
     pdf_url = _pdf_url_from_detail_html(html)
     return pdf_url, used_http
@@ -912,7 +954,8 @@ def iter_jobs(
                     continue
                 if last_report_year is not None and year != last_report_year:
                     if stock_sleep_on and cache.http_get_would_use_network(
-                        _canonical_bulletin_detail_url(href.strip())
+                        _canonical_bulletin_detail_url(href.strip()),
+                        cache_kind="bulletin_detail",
                     ):
                         _sleep_stock_paced(sleep_min_sec, sleep_jitter_sec)
                 pdf_url, detail_used_http = fetch_pdf_url(sess, href, cache, stock_code=code)
@@ -992,7 +1035,7 @@ def main() -> None:
         "--refresh",
         action=argparse.BooleanOptionalAction,
         default=REFRESH_CACHE,
-        help="是否忽略缓存强制拉网（默认取文件常量 REFRESH_CACHE；可用 --no-refresh 关闭）",
+        help="是否仅忽略「无列表」列表页与「无 PDF」详情页的 http 缓存及 akshare 空结果缓存并重拉覆盖（默认取 REFRESH_CACHE；不删已下载 PDF；可用 --no-refresh 关闭）",
     )
     parser.add_argument(
         "--sleep",
